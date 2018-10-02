@@ -29,8 +29,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/pkg/term"
-	"github.com/docker/machine/libmachine/log"
-	"github.com/docker/machine/libmachine/mcnutils"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -96,6 +94,7 @@ type NativeClient struct {
 	Hostname      string           // Hostname is the host to connect to
 	Port          int              // Port is the port to connect to
 	ClientVersion string           // ClientVersion is the version string to send to the server when identifying
+	DialRetry     int              // number of dial retries
 	openSession   *ssh.Session
 }
 
@@ -108,13 +107,14 @@ type Auth struct {
 
 // Config is used to create new client.
 type Config struct {
-	User    string              // username to connect as, required
-	Host    string              // hostname to connect to, required
-	Version string              // ssh client version, "SSH-2.0-Go" by default
-	Port    int                 // port to connect to, 22 by default
-	Auth    *Auth               // authentication methods to use
-	Timeout time.Duration       // connect timeout, 30s by default
-	HostKey ssh.HostKeyCallback // callback for verifying server keys, ssh.InsecureIgnoreHostKey by default
+	User      string              // username to connect as, required
+	Host      string              // hostname to connect to, required
+	Version   string              // ssh client version, "SSH-2.0-Go" by default
+	Port      int                 // port to connect to, 22 by default
+	DialRetry int                 // number of dial retries, 0 (no retries) by default
+	Auth      *Auth               // authentication methods to use
+	Timeout   time.Duration       // connect timeout, 15s by default
+	HostKey   ssh.HostKeyCallback // callback for verifying server keys, ssh.InsecureIgnoreHostKey by default
 }
 
 func (cfg *Config) version() string {
@@ -135,7 +135,7 @@ func (cfg *Config) timeout() time.Duration {
 	if cfg.Timeout != 0 {
 		return cfg.Timeout
 	}
-	return 30 * time.Second
+	return 15 * time.Second
 }
 
 func (cfg *Config) hostKey() ssh.HostKeyCallback {
@@ -158,6 +158,7 @@ func NewClient(cfg *Config) (Client, error) {
 		Hostname:      cfg.Host,
 		Port:          cfg.port(),
 		ClientVersion: cfg.version(),
+		DialRetry:     cfg.DialRetry,
 	}, nil
 }
 
@@ -223,25 +224,25 @@ func NewNativeConfig(user, clientVersion string, auth *Auth, hostKeyCallback ssh
 	}, nil
 }
 
-func (client *NativeClient) dialSuccess() bool {
-	if _, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config); err != nil {
-		log.Debugf("Error dialing TCP: %s", err)
-		return false
-	}
-	return true
-}
-
 func (client *NativeClient) session(command string) (*ssh.Session, error) {
-	if err := mcnutils.WaitFor(client.dialSuccess); err != nil {
+	var conn *ssh.Client
+	var err error
+	for i := client.DialRetry + 1; i > 0; i-- {
+		conn, err = ssh.Dial("tcp", client.addr(), &client.Config)
+		if err == nil {
+			break
+		}
+		time.Sleep(3 * time.Second) // backoff?
+	}
+	if err != nil {
 		return nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
 	}
 
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
-	if err != nil {
-		return nil, fmt.Errorf("Mysterious error dialing TCP for SSH (we already succeeded at least once) : %s", err)
-	}
-
 	return conn.NewSession()
+}
+
+func (client *NativeClient) addr() string {
+	return fmt.Sprintf("%s:%d", client.Hostname, client.Port)
 }
 
 // Output returns the output of the command run on the remote host.
@@ -308,7 +309,6 @@ func (client *NativeClient) Start(command string) (io.ReadCloser, io.ReadCloser,
 	if err := session.Start(command); err != nil {
 		return nil, nil, err
 	}
-
 	client.openSession = session
 	return ioutil.NopCloser(stdout), ioutil.NopCloser(stderr), nil
 }
@@ -328,7 +328,7 @@ func (client *NativeClient) Shell(args ...string) error {
 	var (
 		termWidth, termHeight = 80, 24
 	)
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
+	conn, err := ssh.Dial("tcp", client.addr(), &client.Config)
 	if err != nil {
 		return err
 	}
