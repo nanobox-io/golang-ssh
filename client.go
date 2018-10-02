@@ -96,6 +96,7 @@ type NativeClient struct {
 	ClientVersion string           // ClientVersion is the version string to send to the server when identifying
 	DialRetry     int              // number of dial retries
 	openSession   *ssh.Session
+	openClient    *ssh.Client
 }
 
 // Auth contains auth info
@@ -224,7 +225,7 @@ func NewNativeConfig(user, clientVersion string, auth *Auth, hostKeyCallback ssh
 	}, nil
 }
 
-func (client *NativeClient) session(command string) (*ssh.Session, error) {
+func (client *NativeClient) newSession() (*ssh.Session, *ssh.Client, error) {
 	var conn *ssh.Client
 	var err error
 	for i := client.DialRetry + 1; i > 0; i-- {
@@ -235,10 +236,15 @@ func (client *NativeClient) session(command string) (*ssh.Session, error) {
 		time.Sleep(3 * time.Second) // backoff?
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
+		return nil, nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
 	}
 
-	return conn.NewSession()
+	session, err := conn.NewSession()
+	if err != nil {
+		return nil, nil, nonil(err, conn.Close())
+	}
+
+	return session, conn, nil
 }
 
 func (client *NativeClient) addr() string {
@@ -247,23 +253,25 @@ func (client *NativeClient) addr() string {
 
 // Output returns the output of the command run on the remote host.
 func (client *NativeClient) Output(command string) (string, error) {
-	session, err := client.session(command)
+	session, conn, err := client.newSession()
 	if err != nil {
 		return "", err
 	}
 
 	output, err := session.CombinedOutput(command)
-	defer session.Close()
+	_, _ = session.Close(), conn.Close()
 
 	return string(bytes.TrimSpace(output)), wrapError(err)
 }
 
 // Output returns the output of the command run on the remote host as well as a pty.
 func (client *NativeClient) OutputWithPty(command string) (string, error) {
-	session, err := client.session(command)
+	session, conn, err := client.newSession()
 	if err != nil {
 		return "", nil
 	}
+	defer session.Close()
+	defer conn.Close()
 
 	fd := int(os.Stdin.Fd())
 
@@ -285,31 +293,30 @@ func (client *NativeClient) OutputWithPty(command string) (string, error) {
 	}
 
 	output, err := session.CombinedOutput(command)
-	defer session.Close()
-
 	return string(bytes.TrimSpace(output)), wrapError(err)
 }
 
 // Start starts the specified command without waiting for it to finish. You
 // have to call the Wait function for that.
 func (client *NativeClient) Start(command string) (io.ReadCloser, io.ReadCloser, error) {
-	session, err := client.session(command)
+	session, conn, err := client.newSession()
 	if err != nil {
 		return nil, nil, err
 	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nonil(err, session.Close(), conn.Close())
 	}
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nonil(err, session.Close(), conn.Close())
 	}
 	if err := session.Start(command); err != nil {
-		return nil, nil, err
+		return nil, nil, nonil(err, session.Close(), conn.Close())
 	}
 	client.openSession = session
+	client.openClient = conn
 	return ioutil.NopCloser(stdout), ioutil.NopCloser(stderr), nil
 }
 
@@ -317,8 +324,8 @@ func (client *NativeClient) Start(command string) (io.ReadCloser, io.ReadCloser,
 // returned error follows the same logic as in the exec.Cmd.Wait function.
 func (client *NativeClient) Wait() error {
 	err := client.openSession.Wait()
-	_ = client.openSession.Close()
-	client.openSession = nil
+	_, _ = client.openSession.Close(), client.openClient.Close()
+	client.openSession, client.openClient = nil, nil
 	return err
 }
 
@@ -332,12 +339,12 @@ func (client *NativeClient) Shell(args ...string) error {
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
 	session, err := conn.NewSession()
 	if err != nil {
 		return err
 	}
-
 	defer session.Close()
 
 	session.Stdout = os.Stdout
@@ -401,4 +408,13 @@ func termSize(fd uintptr) []byte {
 	binary.BigEndian.PutUint32(size[4:], uint32(winsize.Height))
 
 	return size
+}
+
+func nonil(err ...error) error {
+	for _, e := range err {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
