@@ -29,8 +29,6 @@ import (
 	"time"
 
 	"github.com/docker/docker/pkg/term"
-	"github.com/docker/machine/libmachine/log"
-	"github.com/docker/machine/libmachine/mcnutils"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -96,7 +94,9 @@ type NativeClient struct {
 	Hostname      string           // Hostname is the host to connect to
 	Port          int              // Port is the port to connect to
 	ClientVersion string           // ClientVersion is the version string to send to the server when identifying
+	DialRetry     int              // number of dial retries
 	openSession   *ssh.Session
+	openClient    *ssh.Client
 }
 
 // Auth contains auth info
@@ -108,13 +108,14 @@ type Auth struct {
 
 // Config is used to create new client.
 type Config struct {
-	User    string              // username to connect as, required
-	Host    string              // hostname to connect to, required
-	Version string              // ssh client version, "SSH-2.0-Go" by default
-	Port    int                 // port to connect to, 22 by default
-	Auth    *Auth               // authentication methods to use
-	Timeout time.Duration       // connect timeout, 30s by default
-	HostKey ssh.HostKeyCallback // callback for verifying server keys, ssh.InsecureIgnoreHostKey by default
+	User      string              // username to connect as, required
+	Host      string              // hostname to connect to, required
+	Version   string              // ssh client version, "SSH-2.0-Go" by default
+	Port      int                 // port to connect to, 22 by default
+	DialRetry int                 // number of dial retries, 0 (no retries) by default
+	Auth      *Auth               // authentication methods to use
+	Timeout   time.Duration       // connect timeout, 15s by default
+	HostKey   ssh.HostKeyCallback // callback for verifying server keys, ssh.InsecureIgnoreHostKey by default
 }
 
 func (cfg *Config) version() string {
@@ -135,7 +136,7 @@ func (cfg *Config) timeout() time.Duration {
 	if cfg.Timeout != 0 {
 		return cfg.Timeout
 	}
-	return 30 * time.Second
+	return 15 * time.Second
 }
 
 func (cfg *Config) hostKey() ssh.HostKeyCallback {
@@ -158,6 +159,7 @@ func NewClient(cfg *Config) (Client, error) {
 		Hostname:      cfg.Host,
 		Port:          cfg.port(),
 		ClientVersion: cfg.version(),
+		DialRetry:     cfg.DialRetry,
 	}, nil
 }
 
@@ -223,46 +225,53 @@ func NewNativeConfig(user, clientVersion string, auth *Auth, hostKeyCallback ssh
 	}, nil
 }
 
-func (client *NativeClient) dialSuccess() bool {
-	if _, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config); err != nil {
-		log.Debugf("Error dialing TCP: %s", err)
-		return false
+func (client *NativeClient) newSession() (*ssh.Session, *ssh.Client, error) {
+	var conn *ssh.Client
+	var err error
+	for i := client.DialRetry + 1; i > 0; i-- {
+		conn, err = ssh.Dial("tcp", client.addr(), &client.Config)
+		if err == nil {
+			break
+		}
+		time.Sleep(3 * time.Second) // backoff?
 	}
-	return true
+	if err != nil {
+		return nil, nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
+	}
+
+	session, err := conn.NewSession()
+	if err != nil {
+		return nil, nil, nonil(err, conn.Close())
+	}
+
+	return session, conn, nil
 }
 
-func (client *NativeClient) session(command string) (*ssh.Session, error) {
-	if err := mcnutils.WaitFor(client.dialSuccess); err != nil {
-		return nil, fmt.Errorf("Error attempting SSH client dial: %s", err)
-	}
-
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
-	if err != nil {
-		return nil, fmt.Errorf("Mysterious error dialing TCP for SSH (we already succeeded at least once) : %s", err)
-	}
-
-	return conn.NewSession()
+func (client *NativeClient) addr() string {
+	return fmt.Sprintf("%s:%d", client.Hostname, client.Port)
 }
 
 // Output returns the output of the command run on the remote host.
 func (client *NativeClient) Output(command string) (string, error) {
-	session, err := client.session(command)
+	session, conn, err := client.newSession()
 	if err != nil {
 		return "", err
 	}
 
 	output, err := session.CombinedOutput(command)
-	defer session.Close()
+	_, _ = session.Close(), conn.Close()
 
 	return string(bytes.TrimSpace(output)), wrapError(err)
 }
 
 // Output returns the output of the command run on the remote host as well as a pty.
 func (client *NativeClient) OutputWithPty(command string) (string, error) {
-	session, err := client.session(command)
+	session, conn, err := client.newSession()
 	if err != nil {
 		return "", nil
 	}
+	defer session.Close()
+	defer conn.Close()
 
 	fd := int(os.Stdin.Fd())
 
@@ -284,32 +293,30 @@ func (client *NativeClient) OutputWithPty(command string) (string, error) {
 	}
 
 	output, err := session.CombinedOutput(command)
-	defer session.Close()
-
 	return string(bytes.TrimSpace(output)), wrapError(err)
 }
 
 // Start starts the specified command without waiting for it to finish. You
 // have to call the Wait function for that.
 func (client *NativeClient) Start(command string) (io.ReadCloser, io.ReadCloser, error) {
-	session, err := client.session(command)
+	session, conn, err := client.newSession()
 	if err != nil {
 		return nil, nil, err
 	}
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nonil(err, session.Close(), conn.Close())
 	}
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nonil(err, session.Close(), conn.Close())
 	}
 	if err := session.Start(command); err != nil {
-		return nil, nil, err
+		return nil, nil, nonil(err, session.Close(), conn.Close())
 	}
-
 	client.openSession = session
+	client.openClient = conn
 	return ioutil.NopCloser(stdout), ioutil.NopCloser(stderr), nil
 }
 
@@ -317,8 +324,8 @@ func (client *NativeClient) Start(command string) (io.ReadCloser, io.ReadCloser,
 // returned error follows the same logic as in the exec.Cmd.Wait function.
 func (client *NativeClient) Wait() error {
 	err := client.openSession.Wait()
-	_ = client.openSession.Close()
-	client.openSession = nil
+	_, _ = client.openSession.Close(), client.openClient.Close()
+	client.openSession, client.openClient = nil, nil
 	return err
 }
 
@@ -328,16 +335,16 @@ func (client *NativeClient) Shell(args ...string) error {
 	var (
 		termWidth, termHeight = 80, 24
 	)
-	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%d", client.Hostname, client.Port), &client.Config)
+	conn, err := ssh.Dial("tcp", client.addr(), &client.Config)
 	if err != nil {
 		return err
 	}
+	defer conn.Close()
 
 	session, err := conn.NewSession()
 	if err != nil {
 		return err
 	}
-
 	defer session.Close()
 
 	session.Stdout = os.Stdout
@@ -401,4 +408,13 @@ func termSize(fd uintptr) []byte {
 	binary.BigEndian.PutUint32(size[4:], uint32(winsize.Height))
 
 	return size
+}
+
+func nonil(err ...error) error {
+	for _, e := range err {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
