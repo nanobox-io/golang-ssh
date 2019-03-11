@@ -25,8 +25,7 @@ func main() {
 }
 
 func connect() error {
-	nanPass := ssh.Auth{Passwords: []string{"pass"}}
-	client, err := ssh.NewNativeClient("user", "localhost", "SSH-2.0-MyCustomClient-1.0", 2222, &nanPass, nil)
+    client, err := ssh.NewNativeClient("user", "localhost", "SSH-2.0-MyCustomClient-1.0", 2222, nil, ssh.AuthPassword("pass"))
 	if err != nil {
 		return fmt.Errorf("Failed to create new client - %s", err)
 	}

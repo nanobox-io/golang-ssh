@@ -13,60 +13,27 @@
 // Package ssh is a helper for working with ssh in go.  The client implementation
 // is a modified version of `docker/machine/libmachine/ssh/client.go` and only
 // uses golang's native ssh client. It has also been improved to resize the tty
-// accordingly.  The key functions are meant to be used by either client or server
+// accordingly. The key functions are meant to be used by either client or server
 // and will generate/store keys if not found.
 package ssh
 
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
-	"github.com/docker/docker/pkg/term"
 	"github.com/docker/machine/libmachine/log"
 	"github.com/docker/machine/libmachine/mcnutils"
+	"github.com/moby/moby/pkg/term"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/terminal"
 )
-
-// ExitError is a conveniance wrapper for (crypto/ssh).ExitError type.
-type ExitError struct {
-	Err      error
-	ExitCode int
-}
-
-// Error implements error interface.
-func (err *ExitError) Error() string {
-	return err.Err.Error()
-}
-
-// Cause implements errors.Causer interface.
-func (err *ExitError) Cause() error {
-	return err.Err
-}
-
-func wrapError(err error) error {
-	switch err := err.(type) {
-	case *ssh.ExitError:
-		e, s := &ExitError{Err: err, ExitCode: -1}, strings.TrimSpace(err.Error())
-		// Best-effort attempt to parse exit code from os/exec error string,
-		// like "Process exited with status 127".
-		if i := strings.LastIndex(s, " "); i != -1 {
-			if n, err := strconv.Atoi(s[i+1:]); err == nil {
-				e.ExitCode = n
-			}
-		}
-		return e
-	default:
-		return err
-	}
-}
 
 // Client is a relic interface that both native and external client matched
 type Client interface {
@@ -99,11 +66,89 @@ type NativeClient struct {
 	openSession   *ssh.Session
 }
 
-// Auth contains auth info
-type Auth struct {
-	Passwords []string // Passwords is a slice of passwords to submit to the server
-	Keys      []string // Keys is a slice of filenames of keys to try
-	RawKeys   [][]byte // RawKeys is a slice of private keys to try
+// AuthPassword creates an AuthMethod for password authentication.
+func AuthPassword(password string) ssh.AuthMethod {
+	return ssh.Password(password)
+}
+
+// AuthKey creates an AuthMethod for SSH key authentication.
+func AuthKey(r io.Reader) (ssh.AuthMethod, error) {
+	key, err := ioutil.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key: %s", err)
+	}
+	privateKey, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %s", err)
+	}
+	return ssh.PublicKeys(privateKey), nil
+}
+
+// AuthKey creates an AuthMethod for SSH key authentication from a key file.
+func AuthKeyFile(keyFilename string) (ssh.AuthMethod, error) {
+	key, err := ioutil.ReadFile(keyFilename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read key file %s: %s", keyFilename, err)
+	}
+	privateKey, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key %s: %s", keyFilename, err)
+	}
+	return ssh.PublicKeys(privateKey), nil
+}
+
+// AuthCert creates an AuthMethod for SSH certificate authentication from the key
+// and certificate bytes.
+func AuthCert(keyReader, certReader io.Reader) (ssh.AuthMethod, error) {
+	key, err := ioutil.ReadAll(keyReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read private key: %s", err)
+	}
+	cert, err := ioutil.ReadAll(certReader)
+	if err != nil {
+		return nil, fmt.Errorf("failed to reate certificate: %s", err)
+	}
+	privateKey, err := ssh.ParsePrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse private key: %s", err)
+	}
+	certificate, err := ParseCertificate(cert)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse certificate: %s", err)
+	}
+	signer, err := ssh.NewCertSigner(certificate, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("key and certificate do not match: %s", err)
+	}
+	return ssh.PublicKeys(signer), nil
+}
+
+// AuthCertFile creates an AuthMethod for SSH certificate authentication from the
+// key and certicate files.
+func AuthCertFile(keyFilename, certFilename string) (ssh.AuthMethod, error) {
+	key, err := os.Open(keyFilename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open key file %s: %s", keyFilename, err)
+	}
+	defer key.Close()
+	cert, err := os.Open(certFilename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open certificate file %s: %s", certFilename, err)
+	}
+	defer cert.Close()
+	return AuthCert(key, cert)
+}
+
+func ParseCertificate(cert []byte) (*ssh.Certificate, error) {
+	out, _, _, _, err := ssh.ParseAuthorizedKey(cert)
+	if err != nil {
+		return nil, err
+	}
+	c, ok := out.(*ssh.Certificate)
+	if !ok {
+		return nil, errors.New("the provided key is not a SSH certificate")
+	}
+	return c, nil
 }
 
 // Config is used to create new client.
@@ -112,7 +157,7 @@ type Config struct {
 	Host    string              // hostname to connect to, required
 	Version string              // ssh client version, "SSH-2.0-Go" by default
 	Port    int                 // port to connect to, 22 by default
-	Auth    *Auth               // authentication methods to use
+	Auth    []ssh.AuthMethod    // authentication methods to use
 	Timeout time.Duration       // connect timeout, 30s by default
 	HostKey ssh.HostKeyCallback // callback for verifying server keys, ssh.InsecureIgnoreHostKey by default
 }
@@ -147,7 +192,7 @@ func (cfg *Config) hostKey() ssh.HostKeyCallback {
 
 // NewClient creates a new Client using the golang ssh library.
 func NewClient(cfg *Config) (Client, error) {
-	config, err := NewNativeConfig(cfg.User, cfg.version(), cfg.Auth, cfg.hostKey())
+	config, err := NewNativeConfig(cfg.User, cfg.version(), cfg.hostKey(), cfg.Auth...)
 	if err != nil {
 		return nil, fmt.Errorf("Error getting config for native Go SSH: %s", err)
 	}
@@ -162,12 +207,12 @@ func NewClient(cfg *Config) (Client, error) {
 }
 
 // NewNativeClient creates a new Client using the golang ssh library
-func NewNativeClient(user, host, clientVersion string, port int, auth *Auth, hostKeyCallback ssh.HostKeyCallback) (Client, error) {
+func NewNativeClient(user, host, clientVersion string, port int, hostKeyCallback ssh.HostKeyCallback, auth ...ssh.AuthMethod) (Client, error) {
 	if clientVersion == "" {
 		clientVersion = "SSH-2.0-Go"
 	}
 
-	config, err := NewNativeConfig(user, clientVersion, auth, hostKeyCallback)
+	config, err := NewNativeConfig(user, clientVersion, hostKeyCallback, auth...)
 	if err != nil {
 		return nil, fmt.Errorf("Error getting config for native Go SSH: %s", err)
 	}
@@ -181,43 +226,14 @@ func NewNativeClient(user, host, clientVersion string, port int, auth *Auth, hos
 }
 
 // NewNativeConfig returns a golang ssh client config struct for use by the NativeClient
-func NewNativeConfig(user, clientVersion string, auth *Auth, hostKeyCallback ssh.HostKeyCallback) (ssh.ClientConfig, error) {
-	var (
-		authMethods []ssh.AuthMethod
-	)
-
-	if auth != nil {
-		rawKeys := auth.RawKeys
-		for _, k := range auth.Keys {
-			key, err := ioutil.ReadFile(k)
-			if err != nil {
-				return ssh.ClientConfig{}, err
-			}
-
-			rawKeys = append(rawKeys, key)
-		}
-
-		for _, key := range rawKeys {
-			privateKey, err := ssh.ParsePrivateKey(key)
-			if err != nil {
-				return ssh.ClientConfig{}, err
-			}
-
-			authMethods = append(authMethods, ssh.PublicKeys(privateKey))
-		}
-
-		for _, p := range auth.Passwords {
-			authMethods = append(authMethods, ssh.Password(p))
-		}
-	}
-
+func NewNativeConfig(user, clientVersion string, hostKeyCallback ssh.HostKeyCallback, auth ...ssh.AuthMethod) (ssh.ClientConfig, error) {
 	if hostKeyCallback == nil {
 		hostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 
 	return ssh.ClientConfig{
 		User:            user,
-		Auth:            authMethods,
+		Auth:            auth,
 		ClientVersion:   clientVersion,
 		HostKeyCallback: hostKeyCallback,
 	}, nil
