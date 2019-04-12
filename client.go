@@ -75,7 +75,7 @@ type Client interface {
 
 	// Shell requests a shell from the remote. If an arg is passed, it tries to
 	// exec them on the server.
-	Shell(args ...string) error
+	Shell(sin io.Reader, sout, serr io.Writer, args ...string) error
 
 	// Start starts the specified command without waiting for it to finish. You
 	// have to call the Wait function for that.
@@ -83,7 +83,7 @@ type Client interface {
 	// The first two io.ReadCloser are the standard output and the standard
 	// error of the executing command respectively. The returned error follows
 	// the same logic as in the exec.Cmd.Start function.
-	Start(command string) (io.ReadCloser, io.ReadCloser, error)
+	Start(command string) (io.ReadCloser, io.ReadCloser, io.WriteCloser, error)
 
 	// Wait waits for the command started by the Start function to exit. The
 	// returned error follows the same logic as in the exec.Cmd.Wait function.
@@ -307,10 +307,10 @@ func (client *NativeClient) OutputWithPty(command string) (string, error) {
 
 // Start starts the specified command without waiting for it to finish. You
 // have to call the Wait function for that.
-func (client *NativeClient) Start(command string) (sout io.ReadCloser, serr io.ReadCloser, reterr error) {
+func (client *NativeClient) Start(command string) (sout io.ReadCloser, serr io.ReadCloser, sin io.WriteCloser, reterr error) {
 	session, conn, err := client.Session()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	defer func() {
 		if reterr != nil {
@@ -321,19 +321,23 @@ func (client *NativeClient) Start(command string) (sout io.ReadCloser, serr io.R
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	if err := session.Start(command); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	client.openSession = session
 	client.openConn = conn
-	return ioutil.NopCloser(stdout), ioutil.NopCloser(stderr), nil
+	return ioutil.NopCloser(stdout), ioutil.NopCloser(stderr), stdin, nil
 }
 
 // Wait waits for the command started by the Start function to exit. The
@@ -349,7 +353,7 @@ func (client *NativeClient) Wait() error {
 
 // Shell requests a shell from the remote. If an arg is passed, it tries to
 // exec them on the server.
-func (client *NativeClient) Shell(args ...string) error {
+func (client *NativeClient) Shell(sin io.Reader, sout, serr io.Writer, args ...string) error {
 	var (
 		termWidth, termHeight = 80, 24
 	)
@@ -365,9 +369,9 @@ func (client *NativeClient) Shell(args ...string) error {
 	}
 	defer session.Close()
 
-	session.Stdout = os.Stdout
-	session.Stderr = os.Stderr
-	session.Stdin = os.Stdin
+	session.Stdout = sout
+	session.Stderr = serr
+	session.Stdin = sin
 
 	modes := ssh.TerminalModes{
 		ssh.ECHO: 1,
